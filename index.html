@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#f5f1ea" />
+  <title>Commonplace — Buy & sell locally</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="auth-required">
+  <header class="topbar">
+    <a class="brand" href="#browse" aria-label="Commonplace home"><span class="brand-mark">+</span> commonplace</a>
+    <nav class="main-nav" aria-label="Main navigation">
+      <button class="nav-link active" data-view="browse">Browse</button>
+      <button class="nav-link" data-view="saved">Saved <span class="nav-count" id="savedCount">0</span></button>
+      <button class="nav-link" data-view="selling">My listings</button>
+      <button class="nav-link" data-view="inbox">Messages</button>
+    </nav>
+    <div class="top-actions">
+      <button class="icon-button" id="profileButton" aria-label="Open profile menu" title="Profile">AM</button>
+      <button class="sell-button" id="openSell">Sell something <span>↗</span></button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero" id="browse">
+      <div class="hero-copy">
+        <p class="eyebrow">A more thoughtful marketplace</p>
+        <h1>Good things,<br /><em>still in circulation.</em></h1>
+        <p class="hero-text">Find useful, beautiful, and loved things from people nearby. No endless scroll required.</p>
+        <div class="search-wrap">
+          <span class="search-icon">⌕</span>
+          <input id="searchInput" type="search" placeholder="Search furniture, cameras, bikes..." autocomplete="off" />
+          <span class="search-shortcut">⌘ K</span>
+        </div>
+      </div>
+      <div class="hero-art" aria-label="A curated selection of objects">
+        <div class="sun-disc"></div>
+        <div class="art-label">Object<br /><strong>of the week</strong></div>
+        <div class="chair-shape"></div>
+        <div class="vase-shape"></div>
+        <div class="plant-leaf leaf-one"></div><div class="plant-leaf leaf-two"></div><div class="plant-leaf leaf-three"></div>
+        <span class="art-caption">A quiet corner<br />for good design</span>
+      </div>
+    </section>
+
+    <section class="content-section" aria-labelledby="nearbyHeading">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Curated near you</p>
+          <h2 id="nearbyHeading">Worth a closer look</h2>
+        </div>
+        <div class="location-tools">
+          <label class="location-search-label" for="locationInput">Shop near</label>
+          <input id="locationInput" type="search" placeholder="Enter a city or neighborhood" autocomplete="off" />
+          <a class="location-map-link" id="openLocationMap" href="https://www.google.com/maps/" target="_blank" rel="noopener noreferrer">Open in Maps ↗</a>
+        </div>
+      </div>
+      <div class="category-row" id="categoryRow" role="tablist" aria-label="Categories"></div>
+      <div class="listing-grid" id="listingGrid"></div>
+      <div class="empty-state hidden" id="emptyState"><div class="empty-icon">⌕</div><h3>Nothing here yet</h3><p>Try a different search or category.</p></div>
+    </section>
+
+    <section class="inbox-section hidden" id="inboxSection" aria-labelledby="inboxHeading">
+      <div class="inbox-heading"><p class="eyebrow">Buyer and seller chat</p><h2 id="inboxHeading">Messages</h2></div>
+      <div class="inbox-layout">
+        <div class="conversation-list" id="conversationList"></div>
+        <div class="conversation-panel" id="conversationPanel">
+          <div class="conversation-placeholder">Choose a conversation to read messages.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer><span>© 2026 commonplace</span><span>Buy less. Choose well. Keep things moving.</span><span>Made for neighbors.</span></footer>
+
+  <div class="modal-backdrop hidden" id="sellModal" role="dialog" aria-modal="true" aria-labelledby="sellTitle">
+    <div class="modal">
+      <button class="close-button" id="closeSell" aria-label="Close sell form">×</button>
+      <p class="eyebrow">Pass it on</p>
+      <h2 id="sellTitle">List something good</h2>
+      <p class="modal-intro">Give an object a second chapter with a few simple details.</p>
+      <form id="sellForm">
+        <label>What are you selling? <input name="title" required placeholder="e.g. Oak bedside table" /></label>
+        <div class="form-row"><label>Price <input name="price" required type="number" min="1" placeholder="$ 0" /></label><label>Category <select id="listingCategory" name="category" required></select></label></div>
+        <div class="add-category-row">
+          <button class="add-category-button" id="showAddCategory" type="button">+ Add category</button>
+          <div class="new-category-form hidden" id="newCategoryForm">
+            <label class="visually-hidden" for="newCategoryName">New category name</label>
+            <input id="newCategoryName" name="name" maxlength="32" placeholder="New category name" />
+            <button class="add-category-confirm" id="addCategoryConfirm" type="button">Add</button>
+            <p class="category-status" id="categoryStatus" aria-live="polite"></p>
+          </div>
+        </div>
+        <div class="listing-location-field">
+          <label for="listingLocation">Item location</label>
+          <input id="listingLocation" name="location" required placeholder="Detecting your location or type an address" autocomplete="street-address" />
+          <input id="listingLatitude" name="latitude" type="hidden" />
+          <input id="listingLongitude" name="longitude" type="hidden" />
+          <div class="pin-actions">
+            <button class="pin-location-button" id="useCurrentLocation" type="button">Use my current location</button>
+            <a class="pin-map-link hidden" id="checkLocationMap" href="https://www.google.com/maps/" target="_blank" rel="noopener noreferrer">Check pin on Google Maps ↗</a>
+          </div>
+          <p class="location-status" id="listingLocationStatus" aria-live="polite">Your location is being detected when this form opens. You can also type an address.</p>
+          <p class="location-attribution">Address lookup by <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a>. The exact pin is shared with buyers.</p>
+        </div>
+        <div class="photo-field">
+          <span class="field-label">Listing photo</span>
+          <div class="photo-actions">
+            <label class="photo-file-button">Browse device<input id="photoFile" type="file" accept="image/*" /></label>
+            <a class="online-photo-button" id="searchImages" href="https://www.google.com/imghp" target="_blank" rel="noopener noreferrer">Search Google Images ↗</a>
+          </div>
+          <label class="image-url-label">Or paste an image URL <input name="image" type="url" placeholder="https://..." /></label>
+          <div class="photo-preview" id="photoPreview"><img id="photoPreviewImage" alt="Listing photo preview" /><span id="photoPreviewEmpty">Photo preview</span></div>
+          <p class="photo-status" id="photoStatus" aria-live="polite">Online search opens in a new tab.</p>
+        </div>
+        <button class="submit-button" type="submit">Publish listing <span>↗</span></button>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="purchaseModal" role="dialog" aria-modal="true" aria-labelledby="purchaseTitle">
+    <section class="modal purchase-modal">
+      <button class="close-button" id="closePurchase" type="button" aria-label="Close purchase request">×</button>
+      <p class="eyebrow">Contact the seller</p>
+      <h2 id="purchaseTitle">Ask about this item</h2>
+      <p class="modal-intro" id="purchaseListingSummary"></p>
+      <form id="purchaseForm">
+        <fieldset class="fulfillment-options">
+          <legend>How would you like to get it?</legend>
+          <label><input type="radio" name="fulfillment" value="delivery" checked /> Delivery</label>
+          <label><input type="radio" name="fulfillment" value="meetup" /> Meet up</label>
+        </fieldset>
+        <label>Message to seller<textarea name="message" rows="4" maxlength="2000" required placeholder="Hi, is this still available? Let me know what works for delivery or meeting up."></textarea></label>
+        <p class="purchase-note">This sends a purchase request and starts a chat. Payment is arranged directly with the seller; no payment is taken here.</p>
+        <p class="purchase-status" id="purchaseStatus" role="status" aria-live="polite"></p>
+        <button class="submit-button" type="submit">Send purchase request <span>↗</span></button>
+      </form>
+    </section>
+  </div>
+
+  <div class="modal-backdrop auth-backdrop hidden" id="authModal" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+    <section class="auth-modal">
+      <button class="close-button" id="closeAuth" aria-label="Close account form">×</button>
+      <p class="eyebrow">Good to see you</p>
+      <h2 id="authTitle">Welcome back.</h2>
+      <p class="auth-intro" id="authIntro">Sign in to keep your finds and listings together.</p>
+      <div class="auth-tabs" role="tablist" aria-label="Account access">
+        <button class="auth-tab active" id="loginTab" type="button" role="tab" aria-selected="true">Log in</button>
+        <button class="auth-tab" id="registerTab" type="button" role="tab" aria-selected="false">Create account</button>
+      </div>
+      <form class="auth-form" id="loginForm">
+        <label>Username or email<input name="identity" autocomplete="username" required /></label>
+        <label>Password<span class="password-field"><input id="loginPassword" name="password" type="password" autocomplete="current-password" placeholder="Your password" required minlength="8" /><button class="password-toggle" type="button" data-password-toggle aria-controls="loginPassword" aria-label="Show password" aria-pressed="false">Show</button></span></label>
+        <button class="submit-button" type="submit">Log in <span>↗</span></button>
+      </form>
+      <form class="auth-form hidden" id="registerForm">
+        <label>Your name<input name="name" autocomplete="name" required /></label>
+        <label>Username<input name="username" autocomplete="username" required minlength="3" maxlength="24" /></label>
+        <label>Email address<input name="email" type="email" autocomplete="email" required /></label>
+        <label>Password<span class="password-field"><input id="registerPassword" name="password" type="password" autocomplete="new-password" required minlength="8" /><button class="password-toggle" type="button" data-password-toggle aria-controls="registerPassword" aria-label="Show password" aria-pressed="false">Show</button></span></label>
+        <label>Confirm password<span class="password-field"><input id="confirmPassword" name="confirmPassword" type="password" autocomplete="new-password" required minlength="8" /><button class="password-toggle" type="button" data-password-toggle aria-controls="confirmPassword" aria-label="Show password" aria-pressed="false">Show</button></span></label>
+        <button class="submit-button" type="submit">Create account <span>↗</span></button>
+      </form>
+      <p class="auth-status" id="authStatus" role="status" aria-live="polite"></p>
+    </section>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
