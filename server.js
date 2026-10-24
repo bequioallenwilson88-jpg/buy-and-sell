@@ -4,12 +4,15 @@ const { statSync } = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { createHash, randomBytes, scryptSync, timingSafeEqual } = require('node:crypto');
+const { applicationDefault, cert, getApps, initializeApp } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
 
 const root = __dirname;
 const port = Number(process.env.PORT) || 4173;
 const host = process.env.HOST || '0.0.0.0';
 const databasePath = process.env.DATABASE_PATH || path.join(root, 'commonplace.sqlite');
 const database = new DatabaseSync(databasePath);
+let firebaseAdminApp;
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -33,6 +36,15 @@ database.exec(`
     token_hash TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     expires_at INTEGER NOT NULL
+  )
+`);
+database.exec(`
+  CREATE TABLE IF NOT EXISTS social_identities (
+    provider TEXT NOT NULL,
+    provider_user_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (provider, provider_user_id),
+    UNIQUE (provider, user_id)
   )
 `);
 database.exec(`
@@ -85,7 +97,11 @@ if (!listingColumns.has('longitude')) database.exec('ALTER TABLE listings ADD CO
 database.exec('PRAGMA foreign_keys = ON');
 
 function sendJson(response, status, payload, headers = {}) {
-  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...headers });
+  response.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    ...headers
+  });
   response.end(JSON.stringify(payload));
 }
 
@@ -121,6 +137,7 @@ function createSession(user, response) {
   database.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
     .run(createHash('sha256').update(sessionId).digest('hex'), user.id, expiresAt);
   response.setHeader('Set-Cookie', sessionCookie(sessionId, 60 * 60 * 24 * 7));
+  return sessionId;
 }
 
 function getSessionId(request) {
@@ -137,9 +154,237 @@ function getAuthenticatedUser(request) {
   return database.prepare('SELECT id, username, email, display_name FROM users WHERE id = ?').get(session.user_id) || null;
 }
 
+function getFirebaseAdminAuth() {
+  if (!firebaseAdminApp) {
+    const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+    const options = {
+      projectId: process.env.FIREBASE_PROJECT_ID || 'common-place-171e0',
+      credential: serviceAccountJson ? cert(JSON.parse(serviceAccountJson)) : applicationDefault()
+    };
+    firebaseAdminApp = getApps()[0] || initializeApp(options);
+  }
+  return getAuth(firebaseAdminApp);
+}
+
+function getCookie(request, name) {
+  return (request.headers.cookie || '').split(';').map((part) => part.trim())
+    .find((part) => part.startsWith(`${name}=`))?.slice(name.length + 1);
+}
+
+function oauthStateCookie(value, maxAge, secure) {
+  return `commonplace_oauth_state=${value}; HttpOnly; SameSite=Lax; Path=/auth; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
+}
+
+function oauthRedirectUri(request, provider) {
+  const baseUrl = process.env.OAUTH_BASE_URL
+    || `${process.env.NODE_ENV === 'production' ? 'https' : (request.headers['x-forwarded-proto'] || 'http').split(',')[0]}://${request.headers['x-forwarded-host'] || request.headers.host || 'localhost:4173'}`;
+  const parsedBaseUrl = new URL(baseUrl);
+  if (!['http:', 'https:'].includes(parsedBaseUrl.protocol) || parsedBaseUrl.username || parsedBaseUrl.password) {
+    throw new Error('Invalid OAuth base URL.');
+  }
+  return new URL(`/auth/${provider}/callback`, parsedBaseUrl).toString();
+}
+
+function socialUsername(email) {
+  const base = (email.split('@')[0].toLowerCase().replace(/[^a-z0-9_.-]/g, '-').replace(/^[^a-z0-9]+/, '').slice(0, 15) || 'member').padEnd(3, 'x');
+  let username;
+  do {
+    username = `${base}-${randomBytes(3).toString('hex')}`.slice(0, 24);
+  } while (database.prepare('SELECT 1 FROM users WHERE username = ? COLLATE NOCASE').get(username));
+  return username;
+}
+
+function getOrCreateSocialUser(provider, providerUserId, email, displayName) {
+  const linkedUser = database.prepare(`
+    SELECT users.id, users.username, users.email, users.display_name
+    FROM social_identities JOIN users ON users.id = social_identities.user_id
+    WHERE social_identities.provider = ? AND social_identities.provider_user_id = ?
+  `).get(provider, providerUserId);
+  if (linkedUser) return linkedUser;
+
+  const existingEmail = database.prepare('SELECT 1 FROM users WHERE email = ? COLLATE NOCASE').get(email);
+  if (existingEmail) {
+    throw new Error('An account already uses this email. Log in with that account first; social account linking is not available yet.');
+  }
+
+  const username = socialUsername(email);
+  const salt = randomBytes(16);
+  const passwordHash = scryptSync(randomBytes(32), salt, 64).toString('hex');
+  const result = database.prepare('INSERT INTO users (username, email, display_name, password_hash, password_salt) VALUES (?, ?, ?, ?, ?)')
+    .run(username, email, displayName, passwordHash, salt.toString('hex'));
+  const userId = Number(result.lastInsertRowid);
+  database.prepare('INSERT INTO social_identities (provider, provider_user_id, user_id) VALUES (?, ?, ?)')
+    .run(provider, providerUserId, userId);
+  return { id: userId, username, email, display_name: displayName };
+}
+
+function oauthErrorRedirect(response, message, stateCookie) {
+  response.writeHead(302, {
+    Location: `/?authError=${encodeURIComponent(message)}`,
+    ...(stateCookie ? { 'Set-Cookie': stateCookie } : {})
+  });
+  response.end();
+}
+
+async function handleOAuth(request, response, url) {
+  const match = url.pathname.match(/^\/auth\/(google|facebook)(\/callback)?$/);
+  if (!match || request.method !== 'GET') return false;
+
+  const provider = match[1];
+  const isCallback = Boolean(match[2]);
+  const isProduction = process.env.NODE_ENV === 'production';
+  const stateCookie = oauthStateCookie('', 0, isProduction);
+  const clientId = provider === 'google' ? process.env.GOOGLE_CLIENT_ID : process.env.FACEBOOK_APP_ID;
+  const clientSecret = provider === 'google' ? process.env.GOOGLE_CLIENT_SECRET : process.env.FACEBOOK_APP_SECRET;
+  if (!clientId || !clientSecret) {
+    oauthErrorRedirect(response, `${provider === 'google' ? 'Google' : 'Facebook'} sign-in is not configured on this server yet.`);
+    return true;
+  }
+
+  const redirectUri = oauthRedirectUri(request, provider);
+  if (!isCallback) {
+    const state = randomBytes(32).toString('hex');
+    const authorizationUrl = provider === 'google'
+      ? new URL('https://accounts.google.com/o/oauth2/v2/auth')
+      : new URL(`https://www.facebook.com/${process.env.FACEBOOK_GRAPH_VERSION || 'v22.0'}/dialog/oauth`);
+    authorizationUrl.search = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: 'code',
+      scope: provider === 'google' ? 'openid email profile' : 'email,public_profile',
+      state
+    }).toString();
+    response.writeHead(302, {
+      Location: authorizationUrl.toString(),
+      'Set-Cookie': oauthStateCookie(state, 600, isProduction)
+    });
+    response.end();
+    return true;
+  }
+
+  const savedState = getCookie(request, 'commonplace_oauth_state') || '';
+  const returnedState = url.searchParams.get('state') || '';
+  const stateMatches = savedState.length === returnedState.length
+    && savedState.length > 0
+    && timingSafeEqual(Buffer.from(savedState), Buffer.from(returnedState));
+  if (!stateMatches) {
+    oauthErrorRedirect(response, 'Sign-in could not be verified. Please try again.', stateCookie);
+    return true;
+  }
+  if (url.searchParams.has('error') || !url.searchParams.get('code')) {
+    oauthErrorRedirect(response, 'Sign-in was cancelled or denied.', stateCookie);
+    return true;
+  }
+
+  try {
+    const tokenParameters = new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uri: redirectUri,
+      code: url.searchParams.get('code')
+    });
+    let tokenResponse;
+    if (provider === 'google') {
+      tokenParameters.set('grant_type', 'authorization_code');
+      tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: tokenParameters,
+        signal: AbortSignal.timeout(10000)
+      });
+    } else {
+      const tokenUrl = new URL(`https://graph.facebook.com/${process.env.FACEBOOK_GRAPH_VERSION || 'v22.0'}/oauth/access_token`);
+      tokenUrl.search = tokenParameters.toString();
+      tokenResponse = await fetch(tokenUrl, { signal: AbortSignal.timeout(10000) });
+    }
+    if (!tokenResponse.ok) throw new Error('Could not complete sign-in with the provider.');
+    const tokenData = await tokenResponse.json();
+    let providerUser;
+    if (provider === 'google') {
+      const profileResponse = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+        headers: { Authorization: `Bearer ${tokenData.access_token}` },
+        signal: AbortSignal.timeout(10000)
+      });
+      if (!profileResponse.ok) throw new Error('Could not read your Google account details.');
+      providerUser = await profileResponse.json();
+      if (providerUser.email_verified !== true) throw new Error('Please use a Google account with a verified email address.');
+      providerUser.id = providerUser.sub;
+    } else {
+      const profileUrl = new URL(`https://graph.facebook.com/${process.env.FACEBOOK_GRAPH_VERSION || 'v22.0'}/me`);
+      profileUrl.search = new URLSearchParams({ fields: 'id,name,email', access_token: tokenData.access_token }).toString();
+      const profileResponse = await fetch(profileUrl, { signal: AbortSignal.timeout(10000) });
+      if (!profileResponse.ok) throw new Error('Could not read your Facebook account details.');
+      providerUser = await profileResponse.json();
+    }
+
+    const email = String(providerUser.email || '').trim().toLowerCase();
+    const displayName = String(providerUser.name || providerUser.given_name || '').trim().slice(0, 80);
+    if (!providerUser.id || !/^\S+@\S+\.\S+$/.test(email) || !displayName) {
+      throw new Error('The provider did not return a name and email address. Check its email permission and try again.');
+    }
+    const record = getOrCreateSocialUser(provider, String(providerUser.id), email, displayName);
+    const user = { id: record.id, username: record.username, email: record.email, displayName: record.display_name };
+    const sessionId = createSession(user, response);
+    response.setHeader('Set-Cookie', [sessionCookie(sessionId, 60 * 60 * 24 * 7), stateCookie]);
+    response.writeHead(302, { Location: '/' });
+    response.end();
+  } catch (error) {
+    oauthErrorRedirect(response, error.message || 'Could not complete social sign-in. Please try again.', stateCookie);
+  }
+  return true;
+}
+
 async function handleApi(request, response, url) {
   if (request.method === 'GET' && url.pathname === '/api/health') {
     sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/api/auth/firebase') {
+    const authorization = request.headers.authorization || '';
+    const idToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+    if (!idToken) {
+      sendJson(response, 401, { error: 'Firebase sign-in token is missing. Please try again.' });
+      return;
+    }
+
+    let decodedToken;
+    try {
+      decodedToken = await getFirebaseAdminAuth().verifyIdToken(idToken);
+    } catch (error) {
+      console.error('Firebase token verification failed:', error.message);
+      sendJson(response, 401, { error: 'Firebase could not verify this sign-in. Check the server credentials and try again.' });
+      return;
+    }
+
+    const email = String(decodedToken.email || '').trim().toLowerCase();
+    const displayName = String(decodedToken.name || email.split('@')[0] || 'Marketplace member').trim().slice(0, 80);
+    if (!decodedToken.uid || !/^\S+@\S+\.\S+$/.test(email)) {
+      sendJson(response, 400, { error: 'Your Firebase account must provide a valid email address.' });
+      return;
+    }
+
+    let userRecord;
+    try {
+      userRecord = getOrCreateSocialUser('firebase', decodedToken.uid, email, displayName);
+    } catch (error) {
+      const isExistingEmail = String(error.message).includes('An account already uses this email');
+      sendJson(response, isExistingEmail ? 409 : 500, {
+        error: isExistingEmail
+          ? 'An account already uses this email. Log in with that account before linking a social provider.'
+          : 'Could not create your marketplace account. Please try again.'
+      });
+      return;
+    }
+
+    const user = {
+      id: userRecord.id,
+      username: userRecord.username,
+      email: userRecord.email,
+      displayName: userRecord.display_name
+    };
+    createSession(user, response);
+    sendJson(response, 200, { user });
     return;
   }
 
@@ -504,6 +749,15 @@ async function handleApi(request, response, url) {
 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  if (url.pathname.startsWith('/auth/')) {
+    try {
+      if (await handleOAuth(request, response, url)) return;
+    } catch (error) {
+      console.error(error);
+      oauthErrorRedirect(response, 'Social sign-in is temporarily unavailable. Please try again.');
+      return;
+    }
+  }
   if (url.pathname.startsWith('/api/')) {
     try {
       await handleApi(request, response, url);
@@ -531,7 +785,10 @@ const server = createServer(async (request, response) => {
 
   try {
     if (!statSync(filePath).isFile()) throw new Error('Not a file');
-    response.writeHead(200, { 'Content-Type': mimeTypes[path.extname(filePath)] || 'application/octet-stream' });
+    response.writeHead(200, {
+      'Content-Type': mimeTypes[path.extname(filePath)] || 'application/octet-stream',
+      'Cache-Control': 'no-cache, must-revalidate'
+    });
     createReadStream(filePath).pipe(response);
   } catch {
     response.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });

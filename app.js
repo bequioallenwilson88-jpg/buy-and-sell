@@ -1,3 +1,17 @@
+import { initializeApp } from 'firebase/app';
+import { getAuth, GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
+
+const firebaseApp = initializeApp({
+  apiKey: 'AIzaSyD2_IAuYtFwGJMO8P2Hss2JNvEW4AmD53s',
+  authDomain: 'common-place-171e0.firebaseapp.com',
+  projectId: 'common-place-171e0',
+  storageBucket: 'common-place-171e0.firebasestorage.app',
+  messagingSenderId: '990540794624',
+  appId: '1:990540794624:web:f9191219e66afd40c881e5',
+  measurementId: 'G-MY3VFBX17E'
+});
+const firebaseAuth = getAuth(firebaseApp);
+
 const seedListings = [
   { id: 1, title: 'Togo-style lounge chair', price: 380, category: 'Furniture', location: 'Fort Greene', time: '2h ago', color: 'rust', image: 'https://images.unsplash.com/photo-1555041469-a586c61ea9bc?auto=format&fit=crop&w=800&q=85' },
   { id: 2, title: 'Hand-thrown stoneware set', price: 64, category: 'Home', location: 'Prospect Heights', time: '4h ago', color: 'cream', image: 'https://images.unsplash.com/photo-1610701596007-11502861dcfa?auto=format&fit=crop&w=800&q=85' },
@@ -197,6 +211,7 @@ const loginForm = document.querySelector('#loginForm');
 const registerForm = document.querySelector('#registerForm');
 const loginTab = document.querySelector('#loginTab');
 const registerTab = document.querySelector('#registerTab');
+const logoutButton = document.querySelector('#logoutButton');
 let authModalHistoryEntry = false;
 const photoFile = document.querySelector('#photoFile');
 const photoUrl = document.querySelector('#sellForm [name="image"]');
@@ -426,6 +441,7 @@ function finishAuthentication(user) {
   document.querySelector('#profileButton').textContent = user.displayName
     .split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase();
   document.querySelector('#profileButton').title = `Signed in as ${user.username}`;
+  logoutButton.classList.remove('hidden');
   document.body.classList.remove('auth-required');
   authModal.classList.add('hidden');
   authStatus.textContent = '';
@@ -454,6 +470,17 @@ function setAuthMode(mode) {
   authStatus.classList.remove('auth-error', 'auth-success');
 }
 
+function showOAuthError() {
+  const params = new URLSearchParams(location.search);
+  const error = params.get('authError');
+  if (!error) return;
+  params.delete('authError');
+  const query = params.toString();
+  history.replaceState(history.state, '', `${location.pathname}${query ? `?${query}` : ''}${location.hash}`);
+  authStatus.textContent = error;
+  authStatus.classList.add('auth-error');
+}
+
 document.querySelector('#profileButton').addEventListener('click', () => {
   if (authModal.classList.contains('hidden')) {
     history.pushState({ ...history.state, commonplaceAuthModal: true }, '', location.href);
@@ -461,6 +488,27 @@ document.querySelector('#profileButton').addEventListener('click', () => {
   }
   authModal.classList.remove('hidden');
   setAuthMode('login');
+});
+logoutButton.addEventListener('click', async () => {
+  logoutButton.disabled = true;
+  try {
+    const response = await fetch('/api/logout', { method: 'POST' });
+    if (!response.ok) throw new Error('Could not sign out. Please try again.');
+    currentUser = null;
+    document.body.classList.add('auth-required');
+    authModal.classList.remove('hidden');
+    setAuthMode('login');
+    document.querySelector('#profileButton').textContent = 'AM';
+    document.querySelector('#profileButton').title = 'Profile';
+    logoutButton.classList.add('hidden');
+    saved.clear();
+    renderListings();
+  } catch (error) {
+    authStatus.textContent = error.message;
+    authStatus.classList.add('auth-error');
+  } finally {
+    logoutButton.disabled = false;
+  }
 });
 window.addEventListener('popstate', (event) => {
   if (authModalHistoryEntry) {
@@ -475,6 +523,37 @@ document.querySelector('#closeAuth').addEventListener('click', closeAuthModal);
 authModal.addEventListener('click', (event) => { if (event.target === authModal) closeAuthModal(); });
 loginTab.addEventListener('click', () => setAuthMode('login'));
 registerTab.addEventListener('click', () => setAuthMode('register'));
+document.querySelectorAll('[data-firebase-provider]').forEach((button) => {
+  button.addEventListener('click', async () => {
+    const provider = new GoogleAuthProvider();
+    const providerLabel = 'Google';
+    button.disabled = true;
+    authStatus.classList.remove('auth-error', 'auth-success');
+    authStatus.textContent = `Connecting to ${providerLabel}...`;
+    try {
+      const credential = await signInWithPopup(firebaseAuth, provider);
+      const idToken = await credential.user.getIdToken();
+      const response = await fetch('/api/auth/firebase', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${idToken}` }
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Could not finish signing in.');
+      finishAuthentication(result.user);
+    } catch (error) {
+      if (error.code === 'auth/configuration-not-found') {
+        authStatus.textContent = `Firebase Authentication is not configured for ${providerLabel}. In Firebase Console, open project common-place-171e0, enable Authentication, then enable ${providerLabel} under Sign-in method.`;
+      } else if (error.code === 'auth/operation-not-allowed') {
+        authStatus.textContent = `${providerLabel} sign-in is disabled. Enable it in Firebase Console under Authentication > Sign-in method.`;
+      } else {
+        authStatus.textContent = error.message || `Could not sign in with ${providerLabel}.`;
+      }
+      authStatus.classList.add('auth-error');
+    } finally {
+      button.disabled = false;
+    }
+  });
+});
 document.querySelectorAll('[data-password-toggle]').forEach((button) => {
   button.addEventListener('click', () => {
     const input = document.getElementById(button.getAttribute('aria-controls'));
@@ -513,7 +592,7 @@ async function submitAuthForm(form, endpoint, payload) {
       finishAuthentication(result.user);
     }
   } catch {
-    authStatus.textContent = 'The account service is unavailable. This site must be deployed with its Node.js server and database enabled.';
+    authStatus.textContent = `Could not reach the account API at ${location.origin}/api. For local use, run "npm start" and open http://localhost:4173. Static-only hosting is not supported; deploy this site with its Node.js server and database.`;
     authStatus.classList.add('auth-error');
   } finally {
     submitButton.disabled = false;
@@ -557,12 +636,14 @@ fetch('/api/me')
       document.body.classList.add('auth-required');
       authModal.classList.remove('hidden');
       setAuthMode('login');
+      showOAuthError();
     }
   })
   .catch(() => {
     document.body.classList.add('auth-required');
     authModal.classList.remove('hidden');
     setAuthMode('login');
+    showOAuthError();
   });
 document.querySelector('#openSell').addEventListener('click', () => {
   modal.classList.remove('hidden');

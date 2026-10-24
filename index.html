@@ -9,6 +9,14 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "firebase/app": "https://www.gstatic.com/firebasejs/13.1.0/firebase-app.js",
+        "firebase/auth": "https://www.gstatic.com/firebasejs/13.1.0/firebase-auth.js"
+      }
+    }
+  </script>
 </head>
 <body class="auth-required">
   <header class="topbar">
@@ -21,6 +29,7 @@
     </nav>
     <div class="top-actions">
       <button class="icon-button" id="profileButton" aria-label="Open profile menu" title="Profile">AM</button>
+      <button class="logout-button hidden" id="logoutButton" type="button">Sign out</button>
       <button class="sell-button" id="openSell">Sell something <span>↗</span></button>
     </div>
   </header>
@@ -156,6 +165,10 @@
         <label>Username or email<input name="identity" autocomplete="username" required /></label>
         <label>Password<span class="password-field"><input id="loginPassword" name="password" type="password" autocomplete="current-password" placeholder="Your password" required minlength="8" /><button class="password-toggle" type="button" data-password-toggle aria-controls="loginPassword" aria-label="Show password" aria-pressed="false">Show</button></span></label>
         <button class="submit-button" type="submit">Log in <span>↗</span></button>
+        <div class="social-login-divider"><span>or continue with</span></div>
+        <div class="social-login-buttons">
+          <button class="social-login-button" type="button" data-firebase-provider="google"><span class="google-mark" aria-hidden="true">G</span>Google</button>
+        </div>
       </form>
       <form class="auth-form hidden" id="registerForm">
         <label>Your name<input name="name" autocomplete="name" required /></label>
@@ -168,6 +181,6 @@
       <p class="auth-status" id="authStatus" role="status" aria-live="polite"></p>
     </section>
   </div>
-  <script src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>

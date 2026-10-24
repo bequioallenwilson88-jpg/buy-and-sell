@@ -44,6 +44,15 @@
 .password-toggle { height: 44px; border: 1px solid var(--line); border-left: 0; padding: 0 12px; background: #eee9e0; color: var(--ink); font-size: 12px; font-weight: 700; }
 .password-toggle:hover, .password-toggle:focus-visible { background: #e2dbcf; }
 .auth-form .submit-button { width: 100%; margin-top: 5px; }
+.social-login-divider { display: flex; align-items: center; gap: 12px; margin: 19px 0 13px; color: var(--muted); font-size: 11px; }
+.social-login-divider::before, .social-login-divider::after { height: 1px; flex: 1; background: var(--line); content: ''; }
+.social-login-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.logout-button { min-height: 38px; border: 1px solid var(--line); padding: 0 12px; background: transparent; color: var(--ink); font-size: 12px; font-weight: 600; cursor: pointer; }
+.logout-button:hover, .logout-button:focus-visible { border-color: var(--ink); background: #fbf8f3; }
+.social-login-button { display: flex; min-height: 43px; align-items: center; justify-content: center; gap: 9px; border: 1px solid var(--line); background: #fff; color: var(--ink); font: inherit; font-size: 12px; font-weight: 600; text-decoration: none; cursor: pointer; }
+.social-login-button:disabled { cursor: wait; opacity: .6; }
+.social-login-button:hover, .social-login-button:focus-visible { border-color: var(--ink); background: #fbf8f3; }
+.google-mark { color: #4285f4; font-size: 17px; font-weight: 700; }
 .auth-status { margin: 17px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .auth-status.auth-error { color: #a63427; font-weight: 600; }
 .auth-status.auth-success { color: #3f6846; font-weight: 600; }
