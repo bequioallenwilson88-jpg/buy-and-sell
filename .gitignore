@@ -2,3 +2,6 @@ commonplace.sqlite
 commonplace.sqlite-shm
 commonplace.sqlite-wal
 node_modules
+.env
+.env.*
+!.env.example

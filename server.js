@@ -4,6 +4,7 @@ const { statSync } = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { createHash, randomBytes, scryptSync, timingSafeEqual } = require('node:crypto');
+const { Pool } = require('pg');
 const { applicationDefault, cert, getApps, initializeApp } = require('firebase-admin/app');
 const { getAuth } = require('firebase-admin/auth');
 
@@ -11,7 +12,41 @@ const root = __dirname;
 const port = Number(process.env.PORT) || 4173;
 const host = process.env.HOST || '0.0.0.0';
 const databasePath = process.env.DATABASE_PATH || path.join(root, 'commonplace.sqlite');
-const database = new DatabaseSync(databasePath);
+if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_URL && !process.env.DATABASE_PATH) {
+  throw new Error('Set DATABASE_URL for production or DATABASE_PATH for a persistent SQLite volume.');
+}
+const postgresPool = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL })
+  : null;
+const sqliteDatabase = postgresPool ? null : new DatabaseSync(databasePath);
+const database = postgresPool ? {
+  prepare(sql) {
+    let parameterIndex = 0;
+    const postgresSql = sql
+      .replace(/INSERT OR IGNORE INTO/gi, 'INSERT INTO')
+      .replace(/ORDER BY ([\w.]+) COLLATE NOCASE/gi, 'ORDER BY LOWER($1)')
+      .replace(/([\w.]+)\s*=\s*\?\s*COLLATE NOCASE/gi, 'LOWER($1) = LOWER(?)')
+      .replace(/COLLATE NOCASE/gi, '')
+      .replace(/\?/g, () => `$${++parameterIndex}`);
+    const ignoreConflict = /^\s*INSERT OR IGNORE INTO/i.test(sql);
+    const returnsId = /^\s*INSERT INTO (users|listings|conversations|messages|categories)\b/i.test(postgresSql);
+    const runSql = `${postgresSql}${ignoreConflict ? ' ON CONFLICT DO NOTHING' : ''}${returnsId ? ' RETURNING id' : ''}`;
+    return {
+      async get(...params) {
+        const result = await postgresPool.query(postgresSql, params);
+        return result.rows[0];
+      },
+      async all(...params) {
+        const result = await postgresPool.query(postgresSql, params);
+        return result.rows;
+      },
+      async run(...params) {
+        const result = await postgresPool.query(runSql, params);
+        return { lastInsertRowid: result.rows[0]?.id, changes: result.rowCount };
+      }
+    };
+  }
+} : sqliteDatabase;
 let firebaseAdminApp;
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
@@ -20,81 +55,135 @@ const mimeTypes = {
   '.json': 'application/json; charset=utf-8'
 };
 
-database.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY,
-    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
-    email TEXT NOT NULL COLLATE NOCASE UNIQUE,
-    display_name TEXT NOT NULL,
-    password_hash TEXT NOT NULL,
-    password_salt TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-database.exec(`
-  CREATE TABLE IF NOT EXISTS sessions (
-    token_hash TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    expires_at INTEGER NOT NULL
-  )
-`);
-database.exec(`
-  CREATE TABLE IF NOT EXISTS social_identities (
-    provider TEXT NOT NULL,
-    provider_user_id TEXT NOT NULL,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    PRIMARY KEY (provider, provider_user_id),
-    UNIQUE (provider, user_id)
-  )
-`);
-database.exec(`
-  CREATE TABLE IF NOT EXISTS listings (
-    id INTEGER PRIMARY KEY,
-    owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    price INTEGER NOT NULL CHECK (price > 0),
-    category TEXT NOT NULL,
-    location TEXT NOT NULL,
-    image TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-database.exec(`
-  CREATE TABLE IF NOT EXISTS categories (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-database.exec(`
-  CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY,
-    listing_id INTEGER NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
-    buyer_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    seller_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    fulfillment TEXT NOT NULL CHECK (fulfillment IN ('delivery', 'meetup')),
-    status TEXT NOT NULL DEFAULT 'requested',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (listing_id, buyer_id)
-  )
-`);
-database.exec(`
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY,
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    body TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-const defaultCategories = ['Furniture', 'Home', 'Tech', 'Fashion', 'Outdoors'];
-const insertDefaultCategory = database.prepare('INSERT OR IGNORE INTO categories (name) VALUES (?)');
-for (const category of defaultCategories) insertDefaultCategory.run(category);
-const listingColumns = new Set(database.prepare('PRAGMA table_info(listings)').all().map((column) => column.name));
-if (!listingColumns.has('latitude')) database.exec('ALTER TABLE listings ADD COLUMN latitude REAL');
-if (!listingColumns.has('longitude')) database.exec('ALTER TABLE listings ADD COLUMN longitude REAL');
-database.exec('PRAGMA foreign_keys = ON');
+async function initializeDatabase() {
+  if (postgresPool) {
+    await postgresPool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id BIGSERIAL PRIMARY KEY,
+        username TEXT NOT NULL,
+        email TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        password_salt TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_unique ON users (LOWER(username));
+      CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique ON users (LOWER(email));
+      CREATE TABLE IF NOT EXISTS sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at BIGINT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS social_identities (
+        provider TEXT NOT NULL,
+        provider_user_id TEXT NOT NULL,
+        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        PRIMARY KEY (provider, provider_user_id),
+        UNIQUE (provider, user_id)
+      );
+      CREATE TABLE IF NOT EXISTS listings (
+        id BIGSERIAL PRIMARY KEY,
+        owner_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        price INTEGER NOT NULL CHECK (price > 0),
+        category TEXT NOT NULL,
+        location TEXT NOT NULL,
+        latitude DOUBLE PRECISION,
+        longitude DOUBLE PRECISION,
+        image TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS categories (
+        id BIGSERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS categories_name_lower_unique ON categories (LOWER(name));
+      CREATE TABLE IF NOT EXISTS conversations (
+        id BIGSERIAL PRIMARY KEY,
+        listing_id BIGINT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+        buyer_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        seller_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        fulfillment TEXT NOT NULL CHECK (fulfillment IN ('delivery', 'meetup')),
+        status TEXT NOT NULL DEFAULT 'requested',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (listing_id, buyer_id)
+      );
+      CREATE TABLE IF NOT EXISTS messages (
+        id BIGSERIAL PRIMARY KEY,
+        conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        sender_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        body TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+  } else {
+    sqliteDatabase.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        display_name TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        password_salt TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS social_identities (
+        provider TEXT NOT NULL,
+        provider_user_id TEXT NOT NULL,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        PRIMARY KEY (provider, provider_user_id),
+        UNIQUE (provider, user_id)
+      );
+      CREATE TABLE IF NOT EXISTS listings (
+        id INTEGER PRIMARY KEY,
+        owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        price INTEGER NOT NULL CHECK (price > 0),
+        category TEXT NOT NULL,
+        location TEXT NOT NULL,
+        image TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS categories (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS conversations (
+        id INTEGER PRIMARY KEY,
+        listing_id INTEGER NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+        buyer_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        seller_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        fulfillment TEXT NOT NULL CHECK (fulfillment IN ('delivery', 'meetup')),
+        status TEXT NOT NULL DEFAULT 'requested',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (listing_id, buyer_id)
+      );
+      CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        body TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    const listingColumns = new Set(sqliteDatabase.prepare('PRAGMA table_info(listings)').all().map((column) => column.name));
+    if (!listingColumns.has('latitude')) sqliteDatabase.exec('ALTER TABLE listings ADD COLUMN latitude REAL');
+    if (!listingColumns.has('longitude')) sqliteDatabase.exec('ALTER TABLE listings ADD COLUMN longitude REAL');
+    sqliteDatabase.exec('PRAGMA foreign_keys = ON');
+  }
+  const defaultCategories = ['Furniture', 'Home', 'Tech', 'Fashion', 'Outdoors'];
+  const insertDefaultCategory = database.prepare('INSERT OR IGNORE INTO categories (name) VALUES (?)');
+  for (const category of defaultCategories) await insertDefaultCategory.run(category);
+}
 
 function sendJson(response, status, payload, headers = {}) {
   response.writeHead(status, {
@@ -131,10 +220,10 @@ function sessionCookie(sessionId, maxAge) {
   return `commonplace_session=${sessionId}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure}`;
 }
 
-function createSession(user, response) {
+async function createSession(user, response) {
   const sessionId = randomBytes(32).toString('hex');
   const expiresAt = Date.now() + 60 * 60 * 24 * 7 * 1000;
-  database.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
+  await database.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
     .run(createHash('sha256').update(sessionId).digest('hex'), user.id, expiresAt);
   response.setHeader('Set-Cookie', sessionCookie(sessionId, 60 * 60 * 24 * 7));
   return sessionId;
@@ -145,13 +234,13 @@ function getSessionId(request) {
     .find((part) => part.startsWith('commonplace_session='))?.split('=')[1];
 }
 
-function getAuthenticatedUser(request) {
+async function getAuthenticatedUser(request) {
   const sessionId = getSessionId(request);
   if (!sessionId) return null;
   const tokenHash = createHash('sha256').update(sessionId).digest('hex');
-  const session = database.prepare('SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?').get(tokenHash, Date.now());
+  const session = await database.prepare('SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?').get(tokenHash, Date.now());
   if (!session) return null;
-  return database.prepare('SELECT id, username, email, display_name FROM users WHERE id = ?').get(session.user_id) || null;
+  return await database.prepare('SELECT id, username, email, display_name FROM users WHERE id = ?').get(session.user_id) || null;
 }
 
 function getFirebaseAdminAuth() {
@@ -185,35 +274,35 @@ function oauthRedirectUri(request, provider) {
   return new URL(`/auth/${provider}/callback`, parsedBaseUrl).toString();
 }
 
-function socialUsername(email) {
+async function socialUsername(email) {
   const base = (email.split('@')[0].toLowerCase().replace(/[^a-z0-9_.-]/g, '-').replace(/^[^a-z0-9]+/, '').slice(0, 15) || 'member').padEnd(3, 'x');
   let username;
   do {
     username = `${base}-${randomBytes(3).toString('hex')}`.slice(0, 24);
-  } while (database.prepare('SELECT 1 FROM users WHERE username = ? COLLATE NOCASE').get(username));
+  } while (await database.prepare('SELECT 1 FROM users WHERE username = ? COLLATE NOCASE').get(username));
   return username;
 }
 
-function getOrCreateSocialUser(provider, providerUserId, email, displayName) {
-  const linkedUser = database.prepare(`
+async function getOrCreateSocialUser(provider, providerUserId, email, displayName) {
+  const linkedUser = await database.prepare(`
     SELECT users.id, users.username, users.email, users.display_name
     FROM social_identities JOIN users ON users.id = social_identities.user_id
     WHERE social_identities.provider = ? AND social_identities.provider_user_id = ?
   `).get(provider, providerUserId);
   if (linkedUser) return linkedUser;
 
-  const existingEmail = database.prepare('SELECT 1 FROM users WHERE email = ? COLLATE NOCASE').get(email);
+  const existingEmail = await database.prepare('SELECT 1 FROM users WHERE email = ? COLLATE NOCASE').get(email);
   if (existingEmail) {
     throw new Error('An account already uses this email. Log in with that account first; social account linking is not available yet.');
   }
 
-  const username = socialUsername(email);
+  const username = await socialUsername(email);
   const salt = randomBytes(16);
   const passwordHash = scryptSync(randomBytes(32), salt, 64).toString('hex');
-  const result = database.prepare('INSERT INTO users (username, email, display_name, password_hash, password_salt) VALUES (?, ?, ?, ?, ?)')
+  const result = await database.prepare('INSERT INTO users (username, email, display_name, password_hash, password_salt) VALUES (?, ?, ?, ?, ?)')
     .run(username, email, displayName, passwordHash, salt.toString('hex'));
   const userId = Number(result.lastInsertRowid);
-  database.prepare('INSERT INTO social_identities (provider, provider_user_id, user_id) VALUES (?, ?, ?)')
+  await database.prepare('INSERT INTO social_identities (provider, provider_user_id, user_id) VALUES (?, ?, ?)')
     .run(provider, providerUserId, userId);
   return { id: userId, username, email, display_name: displayName };
 }
@@ -322,9 +411,9 @@ async function handleOAuth(request, response, url) {
     if (!providerUser.id || !/^\S+@\S+\.\S+$/.test(email) || !displayName) {
       throw new Error('The provider did not return a name and email address. Check its email permission and try again.');
     }
-    const record = getOrCreateSocialUser(provider, String(providerUser.id), email, displayName);
+    const record = await getOrCreateSocialUser(provider, String(providerUser.id), email, displayName);
     const user = { id: record.id, username: record.username, email: record.email, displayName: record.display_name };
-    const sessionId = createSession(user, response);
+    const sessionId = await createSession(user, response);
     response.setHeader('Set-Cookie', [sessionCookie(sessionId, 60 * 60 * 24 * 7), stateCookie]);
     response.writeHead(302, { Location: '/' });
     response.end();
@@ -366,7 +455,7 @@ async function handleApi(request, response, url) {
 
     let userRecord;
     try {
-      userRecord = getOrCreateSocialUser('firebase', decodedToken.uid, email, displayName);
+      userRecord = await getOrCreateSocialUser('firebase', decodedToken.uid, email, displayName);
     } catch (error) {
       const isExistingEmail = String(error.message).includes('An account already uses this email');
       sendJson(response, isExistingEmail ? 409 : 500, {
@@ -383,21 +472,21 @@ async function handleApi(request, response, url) {
       email: userRecord.email,
       displayName: userRecord.display_name
     };
-    createSession(user, response);
+    await createSession(user, response);
     sendJson(response, 200, { user });
     return;
   }
 
   const conversationMessagesMatch = url.pathname.match(/^\/api\/conversations\/(\d+)\/messages$/);
   if (url.pathname === '/api/conversations' || conversationMessagesMatch) {
-    const user = getAuthenticatedUser(request);
+    const user = await getAuthenticatedUser(request);
     if (!user) {
       sendJson(response, 401, { error: 'Please log in to use buyer and seller messages.' });
       return;
     }
 
     if (url.pathname === '/api/conversations' && request.method === 'GET') {
-      const rows = database.prepare(`
+      const rows = await database.prepare(`
         SELECT c.id, c.listing_id, c.buyer_id, c.seller_id, c.fulfillment, c.status,
           l.title, l.price, l.image, buyer.username AS buyer_username,
           buyer.display_name AS buyer_name, seller.username AS seller_username,
@@ -443,7 +532,7 @@ async function handleApi(request, response, url) {
         sendJson(response, 400, { error: 'Choose delivery or meet up and include a message (up to 2,000 characters).' });
         return;
       }
-      const listing = database.prepare('SELECT id, owner_id FROM listings WHERE id = ?').get(Number(listingIdMatch[1]));
+      const listing = await database.prepare('SELECT id, owner_id FROM listings WHERE id = ?').get(Number(listingIdMatch[1]));
       if (!listing) {
         sendJson(response, 404, { error: 'This listing is no longer available.' });
         return;
@@ -452,16 +541,16 @@ async function handleApi(request, response, url) {
         sendJson(response, 400, { error: 'You cannot send a purchase request for your own listing.' });
         return;
       }
-      let conversation = database.prepare('SELECT id FROM conversations WHERE listing_id = ? AND buyer_id = ?').get(listing.id, user.id);
+      let conversation = await database.prepare('SELECT id FROM conversations WHERE listing_id = ? AND buyer_id = ?').get(listing.id, user.id);
       if (conversation) {
-        database.prepare('UPDATE conversations SET fulfillment = ?, status = ? WHERE id = ?')
+        await database.prepare('UPDATE conversations SET fulfillment = ?, status = ? WHERE id = ?')
           .run(fulfillment, 'requested', conversation.id);
       } else {
-        const result = database.prepare('INSERT INTO conversations (listing_id, buyer_id, seller_id, fulfillment) VALUES (?, ?, ?, ?)')
+        const result = await database.prepare('INSERT INTO conversations (listing_id, buyer_id, seller_id, fulfillment) VALUES (?, ?, ?, ?)')
           .run(listing.id, user.id, listing.owner_id, fulfillment);
         conversation = { id: Number(result.lastInsertRowid) };
       }
-      database.prepare('INSERT INTO messages (conversation_id, sender_id, body) VALUES (?, ?, ?)')
+      await database.prepare('INSERT INTO messages (conversation_id, sender_id, body) VALUES (?, ?, ?)')
         .run(conversation.id, user.id, body);
       sendJson(response, 201, { conversationId: conversation.id });
       return;
@@ -469,14 +558,14 @@ async function handleApi(request, response, url) {
 
     if (conversationMessagesMatch) {
       const conversationId = Number(conversationMessagesMatch[1]);
-      const conversation = database.prepare('SELECT id, buyer_id, seller_id FROM conversations WHERE id = ? AND (buyer_id = ? OR seller_id = ?)')
+      const conversation = await database.prepare('SELECT id, buyer_id, seller_id FROM conversations WHERE id = ? AND (buyer_id = ? OR seller_id = ?)')
         .get(conversationId, user.id, user.id);
       if (!conversation) {
         sendJson(response, 404, { error: 'Conversation not found.' });
         return;
       }
       if (request.method === 'GET') {
-        const messages = database.prepare(`
+        const messages = await database.prepare(`
           SELECT messages.id, messages.sender_id, messages.body, messages.created_at,
             users.display_name, users.username
           FROM messages JOIN users ON users.id = messages.sender_id
@@ -504,7 +593,7 @@ async function handleApi(request, response, url) {
           sendJson(response, 400, { error: 'Message cannot be empty or exceed 2,000 characters.' });
           return;
         }
-        const result = database.prepare('INSERT INTO messages (conversation_id, sender_id, body) VALUES (?, ?, ?)')
+        const result = await database.prepare('INSERT INTO messages (conversation_id, sender_id, body) VALUES (?, ?, ?)')
           .run(conversationId, user.id, body);
         sendJson(response, 201, { message: { id: Number(result.lastInsertRowid), senderId: user.id, body, sender: { username: user.username, displayName: user.display_name } } });
         return;
@@ -519,12 +608,12 @@ async function handleApi(request, response, url) {
 
   if (url.pathname === '/api/categories') {
     if (request.method === 'GET') {
-      const categories = database.prepare('SELECT name FROM categories ORDER BY name COLLATE NOCASE').all().map((row) => row.name);
+      const categories = (await database.prepare('SELECT name FROM categories ORDER BY name COLLATE NOCASE').all()).map((row) => row.name);
       sendJson(response, 200, { categories });
       return;
     }
     if (request.method === 'POST') {
-      const user = getAuthenticatedUser(request);
+      const user = await getAuthenticatedUser(request);
       if (!user) {
         sendJson(response, 401, { error: 'Please log in before adding a category.' });
         return;
@@ -542,9 +631,9 @@ async function handleApi(request, response, url) {
         return;
       }
       try {
-        database.prepare('INSERT INTO categories (name, created_by) VALUES (?, ?)').run(name, user.id);
+        await database.prepare('INSERT INTO categories (name, created_by) VALUES (?, ?)').run(name, user.id);
       } catch (error) {
-        if (String(error.message).includes('UNIQUE constraint failed')) {
+        if (error.code === '23505' || String(error.message).includes('UNIQUE constraint failed')) {
           sendJson(response, 409, { error: 'That category already exists.' });
           return;
         }
@@ -560,9 +649,9 @@ async function handleApi(request, response, url) {
   if (request.method === 'GET' && url.pathname === '/api/me') {
     const sessionId = getSessionId(request);
     const tokenHash = sessionId ? createHash('sha256').update(sessionId).digest('hex') : '';
-    const userRecord = getAuthenticatedUser(request);
+    const userRecord = await getAuthenticatedUser(request);
     if (!userRecord) {
-      if (tokenHash) database.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+      if (tokenHash) await database.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
       sendJson(response, 200, { user: null });
       return;
     }
@@ -571,14 +660,14 @@ async function handleApi(request, response, url) {
   }
 
   if (url.pathname === '/api/listings') {
-    const user = getAuthenticatedUser(request);
+    const user = await getAuthenticatedUser(request);
     if (!user) {
       sendJson(response, 401, { error: 'Please log in to view listings.' });
       return;
     }
 
     if (request.method === 'GET') {
-      const rows = database.prepare(`
+      const rows = await database.prepare(`
         SELECT listings.id, listings.owner_id, listings.title, listings.price,
           listings.category, listings.location, listings.latitude, listings.longitude,
           listings.image, listings.created_at,
@@ -620,7 +709,7 @@ async function handleApi(request, response, url) {
       const image = String(data.image || '');
       const latitude = data.latitude === null || data.latitude === '' || data.latitude === undefined ? null : Number(data.latitude);
       const longitude = data.longitude === null || data.longitude === '' || data.longitude === undefined ? null : Number(data.longitude);
-      const categoryExists = database.prepare('SELECT 1 FROM categories WHERE name = ? COLLATE NOCASE').get(category);
+      const categoryExists = await database.prepare('SELECT 1 FROM categories WHERE name = ? COLLATE NOCASE').get(category);
       if (!title || title.length > 120 || !Number.isSafeInteger(price) || price < 1 || !categoryExists || !location || location.length > 120) {
         sendJson(response, 400, { error: 'Enter a title, valid price, category, and location for the listing.' });
         return;
@@ -640,7 +729,7 @@ async function handleApi(request, response, url) {
         return;
       }
 
-      const result = database.prepare('INSERT INTO listings (owner_id, title, price, category, location, latitude, longitude, image) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      const result = await database.prepare('INSERT INTO listings (owner_id, title, price, category, location, latitude, longitude, image) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
         .run(user.id, title, price, category, location, latitude, longitude, image);
       sendJson(response, 201, {
         listing: {
@@ -695,13 +784,13 @@ async function handleApi(request, response, url) {
     const salt = randomBytes(16);
     const passwordHash = scryptSync(password, salt, 64).toString('hex');
     try {
-      const result = database.prepare('INSERT INTO users (username, email, display_name, password_hash, password_salt) VALUES (?, ?, ?, ?, ?)')
+      const result = await database.prepare('INSERT INTO users (username, email, display_name, password_hash, password_salt) VALUES (?, ?, ?, ?, ?)')
         .run(username, email, displayName, passwordHash, salt.toString('hex'));
       const user = { id: Number(result.lastInsertRowid), username, email, displayName };
       sendJson(response, 201, { user });
     } catch (error) {
-      if (String(error.message).includes('UNIQUE constraint failed')) {
-        const field = String(error.message).includes('users.username') ? 'username' : 'email';
+      if (error.code === '23505' || String(error.message).includes('UNIQUE constraint failed')) {
+        const field = String(error.message).toLowerCase().includes('username') ? 'username' : 'email';
         sendJson(response, 409, { error: `That ${field} is already registered. Please log in instead.` });
         return;
       }
@@ -713,7 +802,7 @@ async function handleApi(request, response, url) {
   if (url.pathname === '/api/login') {
     const identity = String(data.identity || '').trim();
     const password = String(data.password || '');
-    const userRecord = database.prepare('SELECT id, username, email, display_name, password_hash, password_salt FROM users WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE LIMIT 1')
+    const userRecord = await database.prepare('SELECT id, username, email, display_name, password_hash, password_salt FROM users WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE LIMIT 1')
       .get(identity, identity);
 
     if (!userRecord) {
@@ -729,7 +818,7 @@ async function handleApi(request, response, url) {
     }
 
     const user = { id: userRecord.id, username: userRecord.username, email: userRecord.email, displayName: userRecord.display_name };
-    createSession(user, response);
+    await createSession(user, response);
     sendJson(response, 200, { user });
     return;
   }
@@ -737,7 +826,7 @@ async function handleApi(request, response, url) {
   if (url.pathname === '/api/logout') {
     const sessionId = getSessionId(request);
     if (sessionId) {
-      database.prepare('DELETE FROM sessions WHERE token_hash = ?')
+      await database.prepare('DELETE FROM sessions WHERE token_hash = ?')
         .run(createHash('sha256').update(sessionId).digest('hex'));
     }
     sendJson(response, 200, { ok: true }, { 'Set-Cookie': sessionCookie('', 0) });
@@ -796,7 +885,12 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.listen(port, host, () => {
-  console.log(`Commonplace running on ${host}:${port}`);
-  console.log(`SQLite database: ${databasePath}`);
+initializeDatabase().then(() => {
+  server.listen(port, host, () => {
+    console.log(`Commonplace running on ${host}:${port}`);
+    console.log(postgresPool ? 'Database: PostgreSQL' : `SQLite database: ${databasePath}`);
+  });
+}).catch((error) => {
+  console.error('Could not initialize the database:', error);
+  process.exitCode = 1;
 });

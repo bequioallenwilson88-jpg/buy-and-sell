@@ -1,31 +1,27 @@
-# Deploying Commonplace on Railway
+# Free Node.js deployment
 
-The login, listings, purchase requests, and messages require the Node server in `server.js`; static-only hosting will not provide the `/api` endpoints.
+This app can run locally with SQLite or use Supabase Postgres in production. Render hosts the Node.js server; Supabase stores accounts, listings, categories, purchase requests, and messages.
 
-1. Push this project to a GitHub repository. Do not commit `commonplace.sqlite`; it is ignored by `.gitignore`.
-2. In Railway, create a project from that repository. The included `railway.toml` selects Nixpacks, starts the service with `npm start`, and checks `/api/health`.
-3. Add a Railway volume mounted at `/data`.
-4. Set these service variables:
+## Deploy
 
-```text
-DATABASE_PATH=/data/commonplace.sqlite
-NODE_ENV=production
-FIREBASE_PROJECT_ID=common-place-171e0
-FIREBASE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
-```
+1. Create a free project at [Supabase](https://supabase.com/dashboard). Open **Connect**, choose a Supavisor pooler connection string suitable for external clients, and keep `sslmode=require`. Do not commit the connection string or share it publicly.
+2. In [Render](https://render.com), choose **New > Blueprint**, connect the GitHub repository, and deploy the `render.yaml` blueprint. Set `DATABASE_URL` to the Supabase connection string when prompted.
+3. Wait for the first Render deploy to finish. It creates the database tables and seeds default categories. Before using the live site, migrate the existing local SQLite data from the project directory in PowerShell:
 
-5. Generate a public Railway domain for the service and open that HTTPS URL. The server listens on `0.0.0.0` and Railway's `PORT`.
+   ```powershell
+   $secret = Read-Host 'Supabase DATABASE_URL' -AsSecureString
+   $env:DATABASE_URL = [System.Net.NetworkCredential]::new('', $secret).Password
+   npm run migrate:sqlite
+   Remove-Item Env:DATABASE_URL
+   Remove-Variable secret
+   ```
 
-The server marks API responses as non-cacheable and requires browsers to revalidate static files, so refreshed deployments and marketplace data are not hidden by stale browser or proxy caches. Changes in the source repository still need to be pushed and deployed; production records remain in the SQLite database on the mounted `/data` volume.
+   The migration copies existing accounts, listings, categories, sessions, and messages. It refuses to copy if the destination already contains user data. Keep the connection string private.
+4. Open the generated `onrender.com` URL and check that `/api/health` returns `{"ok":true}`.
+5. If enabling Google sign-in, set `FIREBASE_SERVICE_ACCOUNT_JSON` in the Render service environment using a Firebase Admin service-account JSON. Also add the Render domain under Firebase Authentication > Settings > Authorized domains. Keep the service account secret in Render only.
 
-In Firebase Console, enable Google under Authentication > Sign-in method, then add your deployed domain under Authentication > Settings > Authorized domains.
+Render's free web service sleeps after 15 minutes without traffic and may take about a minute to wake up. Supabase's free database has 500 MB of storage and can pause after a week of inactivity. Keep backups of important data and check both providers' current free-plan limits. A free Render service does not have durable local disk, so production must use `DATABASE_URL`; it must not rely on the local SQLite file.
 
-```text
-https://common-place-171e0.firebaseapp.com/__/auth/handler
-```
+## Local development
 
-Google credentials are managed by Firebase Authentication; the web Firebase config in `app.js` is public client configuration. `FIREBASE_SERVICE_ACCOUNT_JSON` is private: create a service account with Firebase Authentication verification access and store its JSON only as a server environment variable. Never put service-account credentials in frontend files or commit them. For local development, add `localhost` to Firebase Authentication's authorized domains and provide the same Admin environment variables before starting the server.
-
-The users table stores salted password hashes. Session records, listings, categories, purchase requests, and messages are stored in SQLite. The persistent volume keeps them through deploys/restarts. Railway usage and volumes may require a paid plan; check the current Railway pricing before enabling billing.
-
-For local development, run `npm start` and open `http://localhost:4173`.
+Install dependencies with `npm install`, run `npm start`, and open `http://localhost:4173`. Without `DATABASE_URL`, the server uses `commonplace.sqlite` locally.
