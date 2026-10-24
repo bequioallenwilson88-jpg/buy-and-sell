@@ -9,5 +9,5 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: DATABASE_URL
-        sync: false
+      - key: DATABASE_PATH
+        value: /tmp/commonplace.sqlite

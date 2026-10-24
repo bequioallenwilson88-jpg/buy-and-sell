@@ -6,12 +6,10 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "start": "node server.js",
-    "migrate:sqlite": "node scripts/migrate-sqlite-to-postgres.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "firebase": "^13.1.0",
-    "firebase-admin": "^13.5.0",
-    "pg": "^8.23.1"
+    "firebase-admin": "^13.5.0"
   }
 }

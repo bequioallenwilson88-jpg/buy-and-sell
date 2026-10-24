@@ -4,7 +4,6 @@ const { statSync } = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { createHash, randomBytes, scryptSync, timingSafeEqual } = require('node:crypto');
-const { Pool } = require('pg');
 const { applicationDefault, cert, getApps, initializeApp } = require('firebase-admin/app');
 const { getAuth } = require('firebase-admin/auth');
 
@@ -12,41 +11,7 @@ const root = __dirname;
 const port = Number(process.env.PORT) || 4173;
 const host = process.env.HOST || '0.0.0.0';
 const databasePath = process.env.DATABASE_PATH || path.join(root, 'commonplace.sqlite');
-if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_URL && !process.env.DATABASE_PATH) {
-  throw new Error('Set DATABASE_URL for production or DATABASE_PATH for a persistent SQLite volume.');
-}
-const postgresPool = process.env.DATABASE_URL
-  ? new Pool({ connectionString: process.env.DATABASE_URL })
-  : null;
-const sqliteDatabase = postgresPool ? null : new DatabaseSync(databasePath);
-const database = postgresPool ? {
-  prepare(sql) {
-    let parameterIndex = 0;
-    const postgresSql = sql
-      .replace(/INSERT OR IGNORE INTO/gi, 'INSERT INTO')
-      .replace(/ORDER BY ([\w.]+) COLLATE NOCASE/gi, 'ORDER BY LOWER($1)')
-      .replace(/([\w.]+)\s*=\s*\?\s*COLLATE NOCASE/gi, 'LOWER($1) = LOWER(?)')
-      .replace(/COLLATE NOCASE/gi, '')
-      .replace(/\?/g, () => `$${++parameterIndex}`);
-    const ignoreConflict = /^\s*INSERT OR IGNORE INTO/i.test(sql);
-    const returnsId = /^\s*INSERT INTO (users|listings|conversations|messages|categories)\b/i.test(postgresSql);
-    const runSql = `${postgresSql}${ignoreConflict ? ' ON CONFLICT DO NOTHING' : ''}${returnsId ? ' RETURNING id' : ''}`;
-    return {
-      async get(...params) {
-        const result = await postgresPool.query(postgresSql, params);
-        return result.rows[0];
-      },
-      async all(...params) {
-        const result = await postgresPool.query(postgresSql, params);
-        return result.rows;
-      },
-      async run(...params) {
-        const result = await postgresPool.query(runSql, params);
-        return { lastInsertRowid: result.rows[0]?.id, changes: result.rowCount };
-      }
-    };
-  }
-} : sqliteDatabase;
+const database = new DatabaseSync(databasePath);
 let firebaseAdminApp;
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
@@ -56,70 +21,7 @@ const mimeTypes = {
 };
 
 async function initializeDatabase() {
-  if (postgresPool) {
-    await postgresPool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id BIGSERIAL PRIMARY KEY,
-        username TEXT NOT NULL,
-        email TEXT NOT NULL,
-        display_name TEXT NOT NULL,
-        password_hash TEXT NOT NULL,
-        password_salt TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_unique ON users (LOWER(username));
-      CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique ON users (LOWER(email));
-      CREATE TABLE IF NOT EXISTS sessions (
-        token_hash TEXT PRIMARY KEY,
-        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        expires_at BIGINT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS social_identities (
-        provider TEXT NOT NULL,
-        provider_user_id TEXT NOT NULL,
-        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        PRIMARY KEY (provider, provider_user_id),
-        UNIQUE (provider, user_id)
-      );
-      CREATE TABLE IF NOT EXISTS listings (
-        id BIGSERIAL PRIMARY KEY,
-        owner_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        title TEXT NOT NULL,
-        price INTEGER NOT NULL CHECK (price > 0),
-        category TEXT NOT NULL,
-        location TEXT NOT NULL,
-        latitude DOUBLE PRECISION,
-        longitude DOUBLE PRECISION,
-        image TEXT NOT NULL DEFAULT '',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE TABLE IF NOT EXISTS categories (
-        id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE UNIQUE INDEX IF NOT EXISTS categories_name_lower_unique ON categories (LOWER(name));
-      CREATE TABLE IF NOT EXISTS conversations (
-        id BIGSERIAL PRIMARY KEY,
-        listing_id BIGINT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
-        buyer_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        seller_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        fulfillment TEXT NOT NULL CHECK (fulfillment IN ('delivery', 'meetup')),
-        status TEXT NOT NULL DEFAULT 'requested',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE (listing_id, buyer_id)
-      );
-      CREATE TABLE IF NOT EXISTS messages (
-        id BIGSERIAL PRIMARY KEY,
-        conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        sender_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        body TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-  } else {
-    sqliteDatabase.exec(`
+  database.exec(`
       CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY,
         username TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -174,12 +76,11 @@ async function initializeDatabase() {
         body TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
-    `);
-    const listingColumns = new Set(sqliteDatabase.prepare('PRAGMA table_info(listings)').all().map((column) => column.name));
-    if (!listingColumns.has('latitude')) sqliteDatabase.exec('ALTER TABLE listings ADD COLUMN latitude REAL');
-    if (!listingColumns.has('longitude')) sqliteDatabase.exec('ALTER TABLE listings ADD COLUMN longitude REAL');
-    sqliteDatabase.exec('PRAGMA foreign_keys = ON');
-  }
+  `);
+  const listingColumns = new Set(database.prepare('PRAGMA table_info(listings)').all().map((column) => column.name));
+  if (!listingColumns.has('latitude')) database.exec('ALTER TABLE listings ADD COLUMN latitude REAL');
+  if (!listingColumns.has('longitude')) database.exec('ALTER TABLE listings ADD COLUMN longitude REAL');
+  database.exec('PRAGMA foreign_keys = ON');
   const defaultCategories = ['Furniture', 'Home', 'Tech', 'Fashion', 'Outdoors'];
   const insertDefaultCategory = database.prepare('INSERT OR IGNORE INTO categories (name) VALUES (?)');
   for (const category of defaultCategories) await insertDefaultCategory.run(category);
@@ -888,7 +789,10 @@ const server = createServer(async (request, response) => {
 initializeDatabase().then(() => {
   server.listen(port, host, () => {
     console.log(`Commonplace running on ${host}:${port}`);
-    console.log(postgresPool ? 'Database: PostgreSQL' : `SQLite database: ${databasePath}`);
+    console.log(`SQLite database: ${databasePath}`);
+    if (process.env.NODE_ENV === 'production') {
+      console.warn('Production SQLite storage is temporary; accounts and marketplace data can be lost when the host restarts or redeploys.');
+    }
   });
 }).catch((error) => {
   console.error('Could not initialize the database:', error);
