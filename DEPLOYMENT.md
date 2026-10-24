@@ -16,7 +16,7 @@ This app can run locally with SQLite or use Supabase Postgres in production. Ren
    Remove-Variable secret
    ```
 
-   The migration copies existing accounts, listings, categories, sessions, and messages. It refuses to copy if the destination already contains user data. Keep the connection string private.
+   The migration copies existing accounts, listings, categories, conversations, and messages. You will need to log in again on the deployed domain. It refuses to copy if the destination already contains user data. Keep the connection string private.
 4. Open the generated `onrender.com` URL and check that `/api/health` returns `{"ok":true}`.
 5. If enabling Google sign-in, set `FIREBASE_SERVICE_ACCOUNT_JSON` in the Render service environment using a Firebase Admin service-account JSON. Also add the Render domain under Firebase Authentication > Settings > Authorized domains. Keep the service account secret in Render only.
 

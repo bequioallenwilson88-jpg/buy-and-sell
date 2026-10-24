@@ -18,10 +18,6 @@ const tables = [
     columns: ['provider', 'provider_user_id', 'user_id']
   },
   {
-    name: 'sessions',
-    columns: ['token_hash', 'user_id', 'expires_at']
-  },
-  {
     name: 'listings',
     columns: ['id', 'owner_id', 'title', 'price', 'category', 'location', 'image', 'created_at', 'latitude', 'longitude']
   },
